@@ -42,8 +42,9 @@ def options():
 	parser.add_argument('-g', '--groove_model', help='groove model file. Must be valid .sav model file.', required=True)
 	parser.add_argument('-st', '--shell_thickness_model', help='shell thickness model file. Must be valid .sav model file.', required=True)
 	parser.add_argument('-o','--output', help='Output CSV file. File name will be created if not specified.')
-	parser.add_argument('-s','--size', help='Diameter in cm of size marker. If none provided, sizes will be reported in pixels')
 	parser.add_argument('-w','--writeimg', help='Write out annotated images.', default=False, action='store_true')
+	parser.add_argument('-mi','--mosaicimg', help='Write out mosaic mask images.', default=False, action='store_true')
+	parser.add_argument('-m', '--masks', help='Directory for mosaic mask image files. If -d flag on and no path specified, one will be created.')
 	parser.add_argument('-a','--annotated', help='Directory for annotated image files. If -w flag on and no path specified, one will be created.')
 	parser.add_argument('-n', '--nproc', help='Number of processes to use. Cannot exceed number of CPUs', default=1, type=int)
 	parser.add_argument('--blue', help='Use blue-background mode', default=False, action='store_true')
@@ -95,6 +96,17 @@ def clean_args(args):
 	elif args.writeimg:
 		args.annotated = Path(output_stem + '_annotated')
 		args.annotated.mkdir(exist_ok=True)
+	# if mosaic mask dir provided, make it (if none exists) and validate it
+	# if none provided but masks flagged, make a path first and then do the same
+	if args.masks:
+		args.masks = Path(args.masks)
+		if not args.masks.exists():
+			args.masks.mkdir(exist_ok=True)
+		if not args.masks.is_dir():
+			raise Exception('Specified mosaic mask img dir is not a valid directory:/n%s' % args.dirmask)
+	elif args.mosaicimg:
+		args.masks = Path(output_stem + '_mosaic')
+		args.masks.mkdir(exist_ok=True)
 	if args.nproc > mp.cpu_count():
 		raise Exception('Number of processes cannot exceed number available CPUs.\nNumber processes: %s\nNumber CPUs: %s' % (args.nproc, mp.cpu_count()))
 	
@@ -254,10 +266,12 @@ class Transect(SingleObject):
 		self.tile = None
 		self.kernel_mask = None
 		self.groove_mask = None
+		self.groove_mask_color = None
 		self.groove_metrics = None
 		self.shell_mask = None
 		self.shell_width = None
 		self.mosaic_img = None
+		self.filename = None
 
 	def create_mosaic(self):
 		
@@ -270,7 +284,7 @@ class Transect(SingleObject):
 
 		# Apply this function to all your masks
 		kernel_mask = ensure_3d(self.kernel_mask) * 255
-		groove_mask = ensure_3d(self.groove_mask) * 255
+		groove_mask = self.groove_mask_color 
 		shell_mask = ensure_3d(self.shell_mask) * 255
 
 		tile_rgb = cv2.cvtColor(self.tile, cv2.COLOR_BGR2RGB)
@@ -338,6 +352,7 @@ class VoucherImage():
 		self.hsv = cv2.cvtColor(self.img, cv2.COLOR_BGR2HSV)
 		self.kernel_model = g_model_path #'C:/Users/des346/Desktop/Code Projects/Pecan/pecan_model.sav'
 		self.shell_model = st_model_path #'C:/Users/des346/Desktop/Code Projects/Pecan/pecan_shell_model_2.sav'
+
 		# munsell color-chip matrix for color quantification
 		color_chips_rgb = np.array([
 			[223,200,150],
@@ -469,11 +484,8 @@ class VoucherImage():
 		
 		self.transect.tile = crop_image_centered_on_contr(self.img, self.transect)
 		self.transect.kernel_mask, kernel_contour = segment_kernels(self.transect.tile, self.kernel_model, self.transect.contr)
-		self.transect.groove_mask, self.transect.groove_metrics = segment_grooves(kernel_contour)
+		self.transect.groove_mask, self.transect.groove_mask_color, self.transect.groove_metrics = segment_grooves(kernel_contour, self.mm_per_px)
 		self.transect.shell_mask, self.transect.shell_width = segment_shell(self.transect.tile, self.shell_model, self.transect.kernel_mask, self.transect.contr)
-		self.transect.create_mosaic()
-		plt.imshow(self.transect.mosaic_img)
-		plt.show()
 		
 	def build_kernel_df(self):
 		# defining columns one at a time like this is a bit clunky
@@ -521,19 +533,22 @@ class VoucherImage():
 		# ntht (HEIGHT) is orthogonal to suture
 		# I find this confusing, but this is the standard
 		data = {
-			'ntwd_mm': self.transect.h,
-			'ntht_mm': self.transect.w,
+			'path': self.path,
+			'filename': self.filename,
+			'card_text': self.card_text,
+			'ntwd_mm': (self.transect.h * self.mm_per_px),
+			'ntht_mm': (self.transect.w * self.mm_per_px),
 			'roundness': self.transect.roundness,
-			'shell width': self.transect.shell_width * self.mm_per_px
+			'shell width': (self.transect.shell_width * self.mm_per_px)
 		}
+		
 		# Iterate over the groove metrics and correctly format the column names
-		for index, groove in enumerate(self.transect.groove_metrics, start=1):  # Start at 1 for human-friendly labels
-			for metric in groove:
+		for grooves in self.transect.groove_metrics:  
+			for metric in grooves:
 				metric_name = metric[0]  # Extract metric name (e.g., "Groove Width")
 				value = metric[1] # Extract value
-				# Assign to DataFrame with proper formatting
-				data[f"{metric_name} {index}"] = value
-
+				data[metric_name] = value
+		
 		transect_df = pd.DataFrame([data])
 		self.transect_df = transect_df
 
@@ -558,6 +573,12 @@ class VoucherImage():
 		outpath = '%s/%s_annotated%s' % (str(annot_dir), Path(self.filename).stem, Path(self.filename).suffix)
 		cv2.imwrite(outpath, tmp)
 
+	def write_mosaic_img(self, mosaic_dir):
+		self.transect.create_mosaic()
+		outpath = '%s/%s_mosaic%s' % (str(mosaic_dir), Path(self.filename).stem, Path(self.filename).suffix)
+		converted_mosaic = cv2.cvtColor(self.transect.mosaic_img, cv2.COLOR_RGB2BGR)
+		cv2.imwrite(outpath, converted_mosaic)
+
 def analyze_single_path(path, arg_ns):
 	# separate out directory analysis into a function for easier passing to tqdm/multiprocessing
 	voucher = VoucherImage(path, arg_ns.groove_model, arg_ns.shell_thickness_model)
@@ -565,11 +586,12 @@ def analyze_single_path(path, arg_ns):
 		voucher.thresh_blue_foreground()
 	else:
 		voucher.thresh_foreground()
-	if arg_ns.size:
-		voucher.find_size_marker()
+	voucher.find_size_marker()
 	voucher.find_text_card()
 	voucher.find_nuts()
 	voucher.analyze_transect()
+	if arg_ns.mosaicimg:
+		voucher.write_mosaic_img(arg_ns.masks)
 	voucher.measure_kernel_color()
 	voucher.build_kernel_df()
 	voucher.build_nut_df()
@@ -830,118 +852,60 @@ class TransectTile():
 		# Perform area closing to remove small holes
 		self.final_mask = area_closing(dilated_mask, area_threshold=area_threshold)
 
-	def find_average_shell_width(self, smallest_len=7, largest_len=27, num_samples=100):
+	def find_average_shell_width(self, min_len=7, max_len=35, num_radial=50):
 		"""
-		Finds the average width of a pecan shell by calculating the distance from the outer contour
-		to the nearest point of the inner contour using a sampled subset of points.
+		Finds the average width of a pecan shell
 
 		Parameters:
-		- num_samples: Number of points to sample from the outer contour.
-		- smallest_len: Distance in pixels that the smallest connected points from the outer contour to inner contour must be to be considered valid
-		- largest_len: Distance in pixels that the largest connected points from the outer contour to inner contour must be to be considered valid
+		- num_radial: Number of radial lines drawn.
+		- min_len: Distance in pixels that the smallest connected points from the outer contour to inner contour must be to be considered valid
+		- max_len: Distance in pixels that the largest connected points from the outer contour to inner contour must be to be considered valid
 
 		Returns:
 		- average_width: The average width of the shell.
 		"""
-		final_mask = self.final_mask.astype(np.uint8) * 255
 
-		# Find contours using RETR_TREE to capture both inner and outer contours
-		contours, __ = cv2.findContours(final_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-		largest_contour = max(contours, key=cv2.contourArea)
-
-		mask = np.zeros(final_mask.shape, dtype=np.uint8)
-		cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
-
-		if cv2.contourArea(largest_contour) < 50000:
-
-			def get_skeleton_endpoints(skeleton):
-				"""Finds endpoints of a skeletonized shape."""
-				y_indices, x_indices = np.where(skeleton == 255)
-				endpoints = []
-
-				# Check each pixel to see if it's an endpoint
-				for x, y in zip(x_indices, y_indices):
-					# Extract a 3x3 neighborhood
-					neighbors = skeleton[y - 1:y + 2, x - 1:x + 2]
-					
-					# Count nonzero pixels (excluding the center pixel)
-					num_neighbors = np.count_nonzero(neighbors) - 1
-					
-					if num_neighbors == 1:  # Endpoint has exactly one neighbor
-						endpoints.append((x, y))
-
-				return endpoints
+		def generate_radial_lines(image: np.ndarray, num_lines: int) -> np.ndarray:
+			"""
+			Generate a binary image with radial lines originating from the center.
 			
-			skeleton = skeletonize(mask // 255, method='lee').astype(np.uint8) * 255
+			Parameters:
+				image (np.ndarray): Input image (used to determine size).
+				num_lines (int): Number of radial lines.
 			
-			pruned_skeleton, __, ___ = pcv.morphology.prune(skel_img=skeleton, size=150)
-
-			endpoints = get_skeleton_endpoints(pruned_skeleton)
-
-			def draw_line_between_endpoints(mask, endpoints):
-				"""Draws a 3-pixel-thick line between the two farthest endpoints."""
-				if len(endpoints) < 2:
-					return mask  # Not enough endpoints to connect
-
-				cv2.line(mask, endpoints[0], endpoints[1], 255, thickness=1)
-
-				return mask
+			Returns:
+				np.ndarray: Binary image with radial lines.
+			"""
+			height, width = image.shape[:2]
+			center = (width // 2, height // 2)
 			
-			edited_mask = draw_line_between_endpoints(mask, endpoints)
+			# Create a blank binary image
+			binary_image = np.zeros((height, width), dtype=np.uint8)
+			
+			# Compute angles for the radial lines
+			angles = np.linspace(0, 2 * np.pi, num_lines, endpoint=False)
+			
+			for angle in angles:
+				x = int(center[0] + max(width, height) * np.cos(angle))
+				y = int(center[1] + max(width, height) * np.sin(angle))
+				cv2.line(binary_image, center, (x, y), 255, 1)
+			
+			return binary_image
+    
+		radial_image = generate_radial_lines(self.final_mask, num_radial)
+		image = self.final_mask.astype(np.uint8) * 255
+		intersection = cv2.bitwise_and(image, radial_image)
 
-		else:
-			edited_mask = final_mask
+		# Find contours (i.e., the remaining line segments)
+		contours, _ = cv2.findContours(intersection, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+		
+		# Compute lengths of all detected contours
+		lengths = [cv2.arcLength(contour, closed=False) for contour in contours]
+		filtered_lengths = [length for length in lengths if min_len <= length <= max_len]
 
-		contours_edited, ___ = cv2.findContours(edited_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+		# Return the average length if there are any detected lines
+		self.shell_width = np.mean(filtered_lengths) if lengths else 0.0
 
-		if len(contours_edited) < 2:
-			raise ValueError("The image must contain both inner and outer contours.")
-
-		# Sort contours by area to identify the outer and inner contours
-		contours_edited = sorted(contours_edited, key=cv2.contourArea, reverse=True)
-		outer_contour = contours_edited[0].squeeze()  # First contour is the outer
-		inner_contour = contours_edited[1].squeeze()  # Second contour is the inner
-
-		# Uniformly sample points from the outer contour
-		if len(outer_contour) > num_samples:
-			step = max(1, len(outer_contour) // num_samples)
-			sampled_outer_contour = outer_contour[::step][:num_samples]
-		else:
-			sampled_outer_contour = outer_contour
-
-		# Build KDTree for the inner contour
-		inner_tree = KDTree(inner_contour)
-
-		# Calculate distances and find corresponding points
-		distances = []
-		connections = []  # Store pairs of outer and nearest inner points
-		for point in sampled_outer_contour:
-			distance, index = inner_tree.query(point)
-			if smallest_len < distance < largest_len:
-				distances.append(distance)
-				connections.append((point, inner_contour[index]))
-
-		# Compute the average width of the donut
-		average_width = np.mean(distances)
-		if len(distances) < 20:
-			average_width = "null"
-
-		'''
-		plt.figure(figsize=(8, 8))
-		plt.imshow(self.final_mask, cmap='gray')
-		plt.axis('off')
-		plt.title("Outer to Inner Contour Connections")
-		# Plot contours
-		plt.plot(outer_contour[:, 0], outer_contour[:, 1], 'b-', label='Outer Contour')
-		plt.plot(inner_contour[:, 0], inner_contour[:, 1], 'r-', label='Inner Contour')
-		# Plot connections
-		for outer_point, inner_point in connections:
-			plt.plot([outer_point[0], inner_point[0]], [outer_point[1], inner_point[1]], 'g--', lw=0.7)
-		plt.legend()
-		plt.show()
-		'''
-		self.shell_width = average_width
 
 	def process_annotation(self, polygon_coordinates):
 	
@@ -1072,42 +1036,37 @@ class TransectTile():
 		
 		return grooves, polygons
 	
-	def get_measurements(self, polygon, polygon_coordinates):
-	
-		last_pt = len(polygon_coordinates) - 1
+	def get_measurements(self, polygon, polygon_coordinates, mm_per_pixel, groove_position):
 
-		# Get groove width
-		pt1 = np.array(polygon_coordinates[0])
-		pt2 = np.array(polygon_coordinates[last_pt])
-		groove_width = np.linalg.norm(pt2 - pt1)
+		polygon_np = np.array(polygon_coordinates, dtype=np.float32)
+		rect = cv2.minAreaRect(polygon_np)
 
-		# Get groove angle
-		groove_diff_X = pt2[0] - pt1[0]
-		groove_diff_Y = pt2[1] - pt1[1]
-		groove_angle_radians = np.arctan2(groove_diff_X, groove_diff_Y)
-		groove_angle_degrees = np.degrees(groove_angle_radians)
+		# Get the four corner points of the rotated rectangle
+		box = cv2.boxPoints(rect)
+		box = np.intp(box)  # Convert to integer coordinates
 
-		# Get groove depth
-		# Get center point from groove width line
-		ctr_pt_X = pt1[0] + ((pt2[0]-pt1[0])/2)
-		ctr_pt_Y = pt1[1] + ((pt2[1]-pt1[1])/2)
-		ctr_pt = [ctr_pt_X, ctr_pt_Y]
+		# Extract width, height, and angle
+		(x, y), (w, h), angle = rect
+		
+		if angle <= 45.0:
+			opening_angle = (angle + 90) % 180 - 90
+			opening_width = h
+			depth_angle = angle + 90
+			groove_depth = w  
+		else:
+			opening_angle = (angle + 180) % 180 - 90
+			opening_width = w
+			depth_angle = angle
+			groove_depth = h  
 
-		# Get lowest Y value point in groove
-		lowest_pt = [self.tile_height, self.tile_height]
-		for point in polygon_coordinates:
-			if point[1] < lowest_pt[1]:
-				lowest_pt = point
-		ctr_pt = np.array(ctr_pt)
-		lowest_pt = np.array(lowest_pt)
-		groove_depth = np.linalg.norm(ctr_pt - lowest_pt)
-
-		# Get groove depth angle
-		depth_diff_X = ctr_pt[0] - lowest_pt[0]
-		depth_diff_Y = ctr_pt[1] - lowest_pt[1]
-		depth_angle_radians = np.arctan2(depth_diff_X, depth_diff_Y)
-		depth_angle_degrees = np.degrees(depth_angle_radians)
-
+		'''
+		# Print the results
+		print("Center (x, y):", (x, y))
+		print("Width, Depth:", (opening_width, groove_depth))
+		print("Depth Angle:", depth_angle)
+		print("Opening Angle:", opening_angle)
+		print("Bounding Box Coordinates:", box)
+		'''
 		# Get net area
 		net_area = polygon.area
 
@@ -1117,15 +1076,27 @@ class TransectTile():
 		# Calculate solidarity
 		solidity = net_area / convex_area
 
+		# Determine location of each groove
+		if x >= self.tile_width/2:
+			if groove_position==2:
+				location = "BR"
+			else:
+				location = "TR"
+		else:
+			if groove_position==1:
+				location = "TL"
+			else:
+				location = "BL"
+		
 		# Aggregate measurements
 		self.groove_metrics.append([
-			["Groove Width", float(groove_width)],
-			["Groove Width Angle", float(groove_angle_degrees)],
-			["Groove Depth", float(groove_depth)],
-			["Groove Depth Angle", float(depth_angle_degrees)],
-			["Net Area", float(net_area)],
-			["Convex Area", float(convex_area)],
-			["Solidity", float(solidity)]
+			["Groove Width " + location, (float(opening_width) * mm_per_pixel)],
+			["Groove Width Angle " + location, float(opening_angle)],
+			["Groove Depth " + location, (float(groove_depth) * mm_per_pixel)],
+			["Groove Depth Angle " + location, float(depth_angle)],
+			["Net Area " + location, (float(net_area) * mm_per_pixel * mm_per_pixel)],
+			["Convex Area " + location, (float(convex_area) * mm_per_pixel * mm_per_pixel)],
+			["Solidity " + location, float(solidity)]
 		])
 	
 	def create_groove_mask(self, polygons):
@@ -1164,18 +1135,22 @@ class TransectTile():
 				labeled_mask[rr, cc] = label
 				label += 1
 
-		# Generate a colormap for visualization
-		#cmap = ListedColormap(plt.colormaps["tab20"].colors[:label])  # Use a qualitative colormap
-
-		fig = plt.figure(frameon=False)
-		fig.set_size_inches(labeled_mask.shape[1] / 100, labeled_mask.shape[0] / 100)  # Set size matching the image dimensions
-
-		# Add the axes without any frame
-		ax = plt.Axes(fig, [0, 0, 1, 1])  # Position the image to occupy the full figure
-		ax.set_axis_off()  # Remove axis
-		fig.add_axes(ax)
-
 		self.groove_mask = labeled_mask
+
+		## 🔹 Convert to Color Image ##
+		cmap = ListedColormap(plt.colormaps["tab10"].colors[:label])  # Get colormap with distinct colors
+		  # Create an RGB image initialized to black
+		color_image = np.zeros((self.tile_height, self.tile_width, 3), dtype=np.uint8)
+
+		# Apply colormap only to nonzero values (groove regions)
+		nonzero_mask = labeled_mask > 0  # Boolean mask where grooves exist
+		normed_mask = labeled_mask / labeled_mask.max()  # Normalize for colormap
+
+		# Apply colormap to nonzero areas
+		color_image[nonzero_mask] = (cmap(normed_mask[nonzero_mask])[:, :3] * 255).astype(np.uint8)
+
+		# Store the color image (for later use)
+		self.groove_mask_colored = color_image
 
 	def erode_shell(self):
 		
@@ -1254,17 +1229,17 @@ def segment_kernels(image, model_path, transect_contour):
 	transect.process_mask(binary_mask)
 	return transect.final_mask, transect
 
-def segment_grooves(transect: TransectTile):
+def segment_grooves(transect: TransectTile, mm_per_pixel):
 	detected_grooves = []
 	for coordinate in transect.raw_contours:
 		points, y_coords = transect.process_annotation(coordinate)
 		grooves, polygons = transect.create_grooves(points, y_coords)
 		detected_grooves.append(polygons)
 		for index, groove in enumerate(grooves):
-			transect.get_measurements(polygons[index], groove)
+			transect.get_measurements(polygons[index], groove, mm_per_pixel, len(detected_grooves))
 	transect.create_groove_mask(detected_grooves)
 
-	return transect.groove_mask, transect.groove_metrics
+	return transect.groove_mask, transect.groove_mask_colored, transect.groove_metrics
 
 def segment_shell(image, model_path, kernel_mask, transect_contour):
 	transect = TransectTile(image, model_path, transect_contour)
